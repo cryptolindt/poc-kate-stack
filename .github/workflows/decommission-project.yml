@@ -1,0 +1,132 @@
+name: Decommission GitHub Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: "Project slug to decommission (e.g. project-alpha)"
+        required: true
+        type: string
+      action:
+        description: "Archive repos (reversible) or delete everything (destructive)"
+        required: true
+        type: choice
+        options: [archive, delete]
+        default: archive
+      confirmation:
+        description: "Type the project name again to confirm"
+        required: true
+        type: string
+
+env:
+  GH_TOKEN: ${{ secrets.GH_ORG_TOKEN }}
+  ORG:      ${{ vars.GITHUB_ORG }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.check.outputs.project }}
+    steps:
+      - name: Confirm project name
+        id: check
+        run: |
+          if [ "${{ inputs.project_name }}" != "${{ inputs.confirmation }}" ]; then
+            echo "::error::Confirmation does not match project name"
+            exit 1
+          fi
+
+          PROJECT="${{ inputs.project_name }}"
+
+          if ! gh api "orgs/$ORG/teams/${PROJECT}-admins" --silent 2>/dev/null; then
+            echo "::error::Project '${PROJECT}' not found — team '${PROJECT}-admins' does not exist"
+            exit 1
+          fi
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "✓ Project '${PROJECT}' confirmed for ${{ inputs.action }}"
+
+  decommission:
+    name: "${{ inputs.action == 'archive' && 'Archive' || 'Delete' }} Project"
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: github-org-onboarding
+
+    env:
+      PROJECT: ${{ needs.validate.outputs.project }}
+
+    steps:
+      - name: Discover project repositories
+        id: repos
+        run: |
+          REPOS=$(gh api "orgs/$ORG/repos" --paginate \
+            --jq "[.[].name | select(startswith(\"${PROJECT}-\"))]" | jq -r '.[]')
+          echo "repos<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$REPOS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "Found repos:"
+          echo "$REPOS" | sed 's/^/  - /'
+
+      - name: Archive repositories
+        if: inputs.action == 'archive'
+        run: |
+          while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            gh api --method PATCH "repos/$ORG/$repo" \
+              --field archived=true --silent
+            echo "  ✓ archived: $repo"
+          done <<< "${{ steps.repos.outputs.repos }}"
+
+      - name: Delete repositories
+        if: inputs.action == 'delete'
+        run: |
+          while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            gh repo delete "$ORG/$repo" --yes
+            echo "  ✓ deleted: $repo"
+          done <<< "${{ steps.repos.outputs.repos }}"
+
+      - name: Remove teams
+        if: inputs.action == 'delete'
+        run: |
+          for suffix in admins developers readers; do
+            TEAM="${PROJECT}-${suffix}"
+            if gh api "orgs/$ORG/teams/$TEAM" --silent 2>/dev/null; then
+              gh api --method DELETE "orgs/$ORG/teams/$TEAM" --silent
+              echo "  ✓ deleted team: $TEAM"
+            else
+              echo "  ↩ team not found: $TEAM"
+            fi
+          done
+
+      - name: Write job summary
+        run: |
+          ACTION="${{ inputs.action }}"
+          {
+            echo "## Project Decommissioned: \`${PROJECT}\`"
+            echo ""
+            echo "**Action:** ${ACTION}"
+            echo ""
+            echo "### Repositories"
+            while IFS= read -r repo; do
+              [ -z "$repo" ] && continue
+              if [ "$ACTION" = "archive" ]; then
+                echo "- \`$repo\` — archived"
+              else
+                echo "- \`$repo\` — deleted"
+              fi
+            done <<< "${{ steps.repos.outputs.repos }}"
+            echo ""
+            if [ "$ACTION" = "delete" ]; then
+              echo "### Teams"
+              echo "- \`${PROJECT}-admins\` — deleted"
+              echo "- \`${PROJECT}-developers\` — deleted"
+              echo "- \`${PROJECT}-readers\` — deleted"
+            else
+              echo "*Teams were preserved. Run again with 'delete' to remove teams.*"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

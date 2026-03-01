@@ -1,0 +1,32 @@
+# ArgoCD Helm chart overrides for KATE stack
+# Chart: argo-cd ~7.x from https://argoproj.github.io/argo-helm
+
+configs:
+  params:
+    server.insecure: true
+
+  cm:
+    admin.enabled: "true"
+    statusbadge.enabled: "true"
+
+server:
+  replicas: 2
+
+  service:
+    type: ClusterIP
+
+  metrics:
+    enabled: true
+
+repoServer:
+  replicas: 2
+
+applicationSet:
+  replicas: 2
+
+redis:
+  enabled: true
+
+controller:
+  metrics:
+    enabled: true

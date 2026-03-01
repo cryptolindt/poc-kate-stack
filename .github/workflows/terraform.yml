@@ -1,0 +1,226 @@
+name: Terraform — Azure Infrastructure
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**"]
+  push:
+    branches: [main]
+    paths: ["terraform/**"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      action:
+        description: "Plan only, or plan + apply"
+        required: true
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  ARM_USE_OIDC:        "true"
+  ARM_CLIENT_ID:       ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID:       ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  ENVIRONMENT:         ${{ inputs.environment || 'dev' }}
+
+jobs:
+  plan:
+    name: Plan · ${{ inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.ARM_CLIENT_ID }}
+          tenant-id:       ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ env.ENVIRONMENT }}.tfstate"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -var-file="environments/${{ env.ENVIRONMENT }}.tfvars" \
+            -out="${{ env.ENVIRONMENT }}.tfplan" \
+            -detailed-exitcode \
+            -no-color 2>&1 | tee plan.txt
+          EXIT=${PIPESTATUS[0]}
+          set -e
+          case $EXIT in
+            0) echo "changes=false" >> $GITHUB_OUTPUT ;;
+            1) echo "Plan failed"; exit 1 ;;
+            2) echo "changes=true"  >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Upload Plan Artifact
+        if: steps.plan.outputs.changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: terraform/${{ env.ENVIRONMENT }}.tfplan
+          retention-days: 3
+
+      - name: Post Plan PR Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs      = require('fs');
+            const plan    = fs.readFileSync('terraform/plan.txt', 'utf8');
+            const changes = '${{ steps.plan.outputs.changes }}' === 'true';
+            const env     = '${{ env.ENVIRONMENT }}';
+            const tag     = `Terraform Plan · \`${env}\``;
+            const icon    = changes ? '⚠️' : '✅';
+            const body    = [
+              `### ${icon} ${tag}`,
+              changes
+                ? '**Changes detected — review carefully before merging.**'
+                : '**No changes — infrastructure is up to date.**',
+              '',
+              '<details><summary>Show full plan output</summary>',
+              '',
+              '```hcl',
+              plan.length > 60000
+                ? plan.substring(0, 60000) + '\n\n... output truncated'
+                : plan,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' && c.body.includes(tag)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+  apply:
+    name: Apply · ${{ inputs.environment || 'dev' }}
+    needs: plan
+    if: |
+      needs.plan.outputs.changes == 'true' && (
+        (github.event_name == 'push'             && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+      )
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}-apply
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.ARM_CLIENT_ID }}
+          tenant-id:       ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ env.ENVIRONMENT }}.tfstate"
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: terraform
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve "${{ env.ENVIRONMENT }}.tfplan"
+
+      - name: Sync cluster values to platform-gitops
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          ENV:      ${{ env.ENVIRONMENT }}
+        run: |
+          ESO_CLIENT_ID=$(terraform output -raw eso_client_id)
+          ARGOCD_CLIENT_ID=$(terraform output -raw argocd_client_id)
+          KV_URI=$(terraform output -raw key_vault_uri)
+
+          git clone --depth=1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ vars.GITHUB_ORG }}/platform-gitops.git" \
+            /tmp/gitops
+
+          mkdir -p /tmp/gitops/clusters/${ENV}
+          cat > /tmp/gitops/clusters/${ENV}/values.yaml << EOF
+          # Auto-generated by platform-azure-infra — DO NOT EDIT MANUALLY
+          # Updated:  $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Run by:   ${{ github.actor }}
+          # Run URL:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          environment:    "${ENV}"
+          esoClientId:    "${ESO_CLIENT_ID}"
+          argocdClientId: "${ARGOCD_CLIENT_ID}"
+          keyVaultUri:    "${KV_URI}"
+          EOF
+
+          cd /tmp/gitops
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "clusters/${ENV}/values.yaml"
+
+          if git diff --staged --quiet; then
+            echo "✓ platform-gitops already up to date"
+          else
+            git commit -m "chore(${ENV}): sync cluster values from terraform apply [skip ci]"
+            git push
+            echo "✓ platform-gitops updated — ArgoCD will reconcile within its sync interval"
+          fi

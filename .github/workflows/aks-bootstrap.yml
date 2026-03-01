@@ -1,0 +1,155 @@
+name: AKS Bootstrap — One-Time Cluster Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      gitops_repo_url:
+        description: "platform-gitops repo URL for the App-of-Apps root Application"
+        required: true
+        type: string
+      argocd_chart_version:
+        description: "ArgoCD Helm chart version"
+        required: false
+        type: string
+        default: "7.3.11"
+      eso_chart_version:
+        description: "External Secrets Operator Helm chart version"
+        required: false
+        type: string
+        default: "0.9.20"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ARM_CLIENT_ID:       ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID:       ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+jobs:
+  bootstrap:
+    name: Bootstrap · ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}-apply
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.ARM_CLIENT_ID }}
+          tenant-id:       ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - name: Install kubectl and Helm
+        uses: azure/setup-kubectl@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Get AKS credentials
+        run: |
+          CLUSTER_NAME="aks-${{ vars.PROJECT_NAME || 'myplatform' }}-${{ inputs.environment }}"
+          RG_NAME="rg-${{ vars.PROJECT_NAME || 'myplatform' }}-${{ inputs.environment }}"
+          az aks get-credentials \
+            --resource-group "$RG_NAME" \
+            --name "$CLUSTER_NAME" \
+            --overwrite-existing
+
+      - name: Install ArgoCD
+        run: |
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm repo update
+          helm upgrade --install argocd argo/argo-cd \
+            --namespace argocd --create-namespace \
+            --version "${{ inputs.argocd_chart_version }}" \
+            --values kubernetes/argocd/values.yaml \
+            --wait --timeout 10m
+
+      - name: Install External Secrets Operator
+        run: |
+          helm repo add external-secrets https://charts.external-secrets.io
+          helm repo update
+          helm upgrade --install external-secrets external-secrets/external-secrets \
+            --namespace external-secrets --create-namespace \
+            --version "${{ inputs.eso_chart_version }}" \
+            --set installCRDs=true \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=external-secrets \
+            --set "podLabels.azure\.workload\.identity/use=true" \
+            --wait --timeout 10m
+
+      - name: Retrieve Terraform outputs
+        id: tf-outputs
+        run: |
+          RG_NAME="rg-${{ vars.PROJECT_NAME || 'myplatform' }}-${{ inputs.environment }}"
+
+          ESO_CLIENT_ID=$(az identity show \
+            --name "id-eso-${{ vars.PROJECT_NAME || 'myplatform' }}-${{ inputs.environment }}" \
+            --resource-group "$RG_NAME" \
+            --query clientId -o tsv)
+
+          KEY_VAULT_URI=$(az keyvault show \
+            --name "kv-${{ vars.PROJECT_NAME || 'myplatform' }}-${{ inputs.environment }}" \
+            --resource-group "$RG_NAME" \
+            --query properties.vaultUri -o tsv)
+
+          TENANT_ID=$(az account show --query tenantId -o tsv)
+
+          echo "eso_client_id=$ESO_CLIENT_ID" >> "$GITHUB_OUTPUT"
+          echo "key_vault_uri=$KEY_VAULT_URI" >> "$GITHUB_OUTPUT"
+          echo "tenant_id=$TENANT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Apply ESO ServiceAccount
+        run: |
+          sed "s|ESO_CLIENT_ID|${{ steps.tf-outputs.outputs.eso_client_id }}|g" \
+            kubernetes/external-secrets/serviceaccount.yaml | kubectl apply -f -
+
+      - name: Apply ClusterSecretStore
+        run: |
+          sed \
+            -e "s|TENANT_ID|${{ steps.tf-outputs.outputs.tenant_id }}|g" \
+            -e "s|KEY_VAULT_URI|${{ steps.tf-outputs.outputs.key_vault_uri }}|g" \
+            kubernetes/external-secrets/cluster-secret-store.yaml | kubectl apply -f -
+
+      - name: Apply App-of-Apps root Application
+        run: |
+          sed "s|GITOPS_REPO_URL|${{ inputs.gitops_repo_url }}|g" \
+            kubernetes/argocd/app-of-apps.yaml | kubectl apply -f -
+
+      - name: Apply example ExternalSecret (validation)
+        run: kubectl apply -f kubernetes/external-secrets/example-external-secret.yaml
+
+      - name: Verify bootstrap
+        run: |
+          echo "── ArgoCD pods ──"
+          kubectl get pods -n argocd
+          echo ""
+          echo "── ESO pods ──"
+          kubectl get pods -n external-secrets
+          echo ""
+          echo "── ClusterSecretStore ──"
+          kubectl get clustersecretstore azure-keyvault-store
+          echo ""
+          echo "── App-of-Apps ──"
+          kubectl get application -n argocd app-of-apps 2>/dev/null || echo "(not yet synced)"
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## AKS Bootstrap Complete: \`${{ inputs.environment }}\`"
+            echo ""
+            echo "| Component | Status |"
+            echo "|---|---|"
+            echo "| ArgoCD | Installed (chart ${{ inputs.argocd_chart_version }}) |"
+            echo "| External Secrets Operator | Installed (chart ${{ inputs.eso_chart_version }}) |"
+            echo "| ClusterSecretStore | Applied |"
+            echo "| App-of-Apps | Applied → ${{ inputs.gitops_repo_url }} |"
+            echo ""
+            echo "**Next steps:** verify ArgoCD is syncing applications from the GitOps repo."
+          } >> "$GITHUB_STEP_SUMMARY"

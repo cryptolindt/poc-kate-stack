@@ -1,0 +1,278 @@
+name: Onboard New GitHub Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: "Project slug — lowercase letters and hyphens (e.g. project-alpha)"
+        required: true
+        type: string
+      description:
+        description: "Human-readable project description"
+        required: true
+        type: string
+      admins:
+        description: "Comma-separated GitHub usernames for the admin team"
+        required: true
+        type: string
+      developers:
+        description: "Comma-separated GitHub usernames for the developer team"
+        required: true
+        type: string
+      readers:
+        description: "Comma-separated GitHub usernames for read-only access (optional)"
+        required: false
+        type: string
+        default: ""
+      repositories:
+        description: "Comma-separated repo suffixes to create (e.g. app,infra,gitops)"
+        required: true
+        type: string
+        default: "app,infra,gitops"
+      visibility:
+        description: "Repository visibility"
+        required: true
+        type: choice
+        options: [private, internal, public]
+        default: private
+
+env:
+  GH_TOKEN: ${{ secrets.GH_ORG_TOKEN }}
+  ORG:      ${{ vars.GITHUB_ORG }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Job 1: Validate before any API calls ──────────────────────────────────
+  validate:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.check.outputs.project }}
+    steps:
+      - name: Check project name
+        id: check
+        run: |
+          PROJECT="${{ inputs.project_name }}"
+
+          # Enforce slug format: lowercase, digits, hyphens; 2–39 chars
+          if ! echo "$PROJECT" | grep -qE '^[a-z][a-z0-9-]{1,38}$'; then
+            echo "::error::project_name must match ^[a-z][a-z0-9-]{1,38}$"
+            exit 1
+          fi
+
+          # Check for duplicate: our slug == team name (already lowercase+hyphens)
+          if gh api "orgs/$ORG/teams/${PROJECT}-admins" --silent 2>/dev/null; then
+            echo "::error::Project '${PROJECT}' already exists — team '${PROJECT}-admins' found"
+            exit 1
+          fi
+
+          echo "project=$PROJECT" >> $GITHUB_OUTPUT
+          echo "✓ '${PROJECT}' is valid and available"
+
+  # ── Job 2: Create all GitHub resources ────────────────────────────────────
+  # Runs in a protected environment — configure required reviewers in
+  # GitHub Settings → Environments → github-org-onboarding.
+  onboard:
+    name: Create Project Setup
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: github-org-onboarding
+
+    env:
+      PROJECT: ${{ needs.validate.outputs.project }}
+
+    steps:
+      # ── Teams ──────────────────────────────────────────────────────────────
+      - name: Create teams
+        run: |
+          # For our naming convention, team slug == team name (lowercase+hyphens).
+          # We exploit this to check existence before creation.
+          create_team() {
+            local name="$1" desc="$2"
+            if gh api "orgs/$ORG/teams/$name" --silent 2>/dev/null; then
+              echo "  ↩ already exists: $name"
+              return
+            fi
+            gh api --method POST "orgs/$ORG/teams" \
+              --field name="$name" \
+              --field description="$desc" \
+              --field privacy=closed \
+              --silent
+            echo "  ✓ created: $name"
+          }
+
+          create_team "${PROJECT}-admins"     "Admins for ${PROJECT}"
+          create_team "${PROJECT}-developers" "Developers for ${PROJECT}"
+          create_team "${PROJECT}-readers"    "Read-only access for ${PROJECT}"
+
+      # ── Team Membership ────────────────────────────────────────────────────
+      - name: Assign team members
+        run: |
+          # PUT /orgs/{org}/teams/{slug}/memberships/{username} is idempotent —
+          # safe to call repeatedly; adds member if absent, updates role if changed.
+          add_members() {
+            local team="$1" role="$2" csv="$3"
+            [ -z "$csv" ] && return 0
+            IFS=',' read -ra USERS <<< "$csv"
+            for user in "${USERS[@]}"; do
+              user=$(echo "$user" | xargs)
+              [ -z "$user" ] && continue
+              gh api --method PUT "orgs/$ORG/teams/$team/memberships/$user" \
+                --field role="$role" --silent
+              echo "  ✓ $user → $team ($role)"
+            done
+          }
+
+          add_members "${PROJECT}-admins"     maintainer "${{ inputs.admins }}"
+          add_members "${PROJECT}-developers" member     "${{ inputs.developers }}"
+          add_members "${PROJECT}-readers"    member     "${{ inputs.readers }}"
+
+      # ── Repositories ───────────────────────────────────────────────────────
+      - name: Create repositories and assign team access
+        run: |
+          IFS=',' read -ra SUFFIXES <<< "${{ inputs.repositories }}"
+          for suffix in "${SUFFIXES[@]}"; do
+            suffix=$(echo "$suffix" | xargs)
+            REPO="${PROJECT}-${suffix}"
+            echo "── $REPO ───────────────────────────────────────────"
+
+            if gh api "repos/$ORG/$REPO" --silent 2>/dev/null; then
+              echo "  ↩ already exists: $REPO"
+            else
+              gh repo create "$ORG/$REPO" \
+                --description "${{ inputs.description }} (${suffix})" \
+                --${{ inputs.visibility }} \
+                --disable-wiki \
+                --no-readme
+              echo "  ✓ created: $ORG/$REPO"
+            fi
+
+            # Team permissions are idempotent (PUT) — always apply to cover
+            # pre-existing repos that may have drifted.
+            gh api --method PUT "orgs/$ORG/teams/${PROJECT}-admins/repos/$ORG/$REPO" \
+              --field permission=admin  --silent
+            gh api --method PUT "orgs/$ORG/teams/${PROJECT}-developers/repos/$ORG/$REPO" \
+              --field permission=push   --silent
+            gh api --method PUT "orgs/$ORG/teams/${PROJECT}-readers/repos/$ORG/$REPO" \
+              --field permission=pull   --silent
+            echo "  ✓ team permissions set"
+          done
+
+      # ── Branch Rulesets ────────────────────────────────────────────────────
+      # Uses the newer Rulesets API (replaces deprecated branch protection).
+      - name: Apply branch rulesets
+        run: |
+          IFS=',' read -ra SUFFIXES <<< "${{ inputs.repositories }}"
+          for suffix in "${SUFFIXES[@]}"; do
+            suffix=$(echo "$suffix" | xargs)
+            REPO="${PROJECT}-${suffix}"
+
+            # Check if the ruleset already exists to avoid duplicates on re-run
+            EXISTING=$(gh api "repos/$ORG/$REPO/rulesets" --jq '.[].name' 2>/dev/null || true)
+            if echo "$EXISTING" | grep -qx "protect-default-branch"; then
+              echo "  ↩ ruleset already exists: $REPO"
+              continue
+            fi
+
+            gh api \
+              --method POST "repos/$ORG/$REPO/rulesets" \
+              --field name="protect-default-branch" \
+              --field target=branch \
+              --field enforcement=active \
+              --raw-field 'conditions={"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}}' \
+              --raw-field 'rules=[
+                {"type":"deletion"},
+                {"type":"non_fast_forward"},
+                {"type":"pull_request","parameters":{
+                  "required_approving_review_count":1,
+                  "dismiss_stale_reviews_on_push":true,
+                  "require_code_owner_review":true,
+                  "require_last_push_approval":false,
+                  "required_review_thread_resolution":true
+                }},
+                {"type":"required_status_checks","parameters":{
+                  "required_status_checks":[],
+                  "strict_required_status_checks_policy":false
+                }}
+              ]' --silent
+            echo "  ✓ ruleset applied: $REPO"
+          done
+
+      # ── Initial Repository Content ─────────────────────────────────────────
+      - name: Push initial commit
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          IFS=',' read -ra SUFFIXES <<< "${{ inputs.repositories }}"
+          for suffix in "${SUFFIXES[@]}"; do
+            suffix=$(echo "$suffix" | xargs)
+            REPO="${PROJECT}-${suffix}"
+            DIR="/tmp/${REPO}"
+
+            git clone --depth=1 \
+              "https://x-access-token:$GH_TOKEN@github.com/$ORG/$REPO.git" \
+              "$DIR" 2>/dev/null || { echo "  ↩ skipping $REPO"; continue; }
+
+            cd "$DIR"
+
+            # Skip if repo already has commits (was pre-existing)
+            if [ "$(git rev-list --count HEAD 2>/dev/null || echo 0)" -gt "0" ]; then
+              echo "  ↩ $REPO already has commits"
+              cd -; continue
+            fi
+
+            # README
+            DESCRIPTION="${{ inputs.description }}"
+            {
+              echo "# ${REPO}"
+              echo ""
+              echo "${DESCRIPTION}"
+              echo ""
+              echo "> Provisioned by **platform-github-onboarding** on $(date +%Y-%m-%d)."
+            } > README.md
+
+            # CODEOWNERS — all changes require admin team review by default
+            mkdir -p .github
+            {
+              echo "# All changes require admin team review"
+              echo "*   @${ORG}/${PROJECT}-admins"
+            } > .github/CODEOWNERS
+
+            git add -A
+            git commit -m "chore: initial repository setup"
+            git push origin HEAD:main
+            echo "  ✓ initial commit pushed to $REPO"
+            cd -
+          done
+
+  # ── Job 3: Workflow Summary ────────────────────────────────────────────────
+  summary:
+    name: Summary
+    needs: [validate, onboard]
+    runs-on: ubuntu-latest
+    if: always() && needs.onboard.result == 'success'
+    steps:
+      - name: Write job summary
+        run: |
+          PROJECT="${{ needs.validate.outputs.project }}"
+          {
+            echo "## ✅ Project Onboarding Complete: \`${PROJECT}\`"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Description** | ${{ inputs.description }} |"
+            echo "| **Admins** | \`${{ inputs.admins }}\` |"
+            echo "| **Developers** | \`${{ inputs.developers }}\` |"
+            echo "| **Readers** | \`${{ inputs.readers || '—' }}\` |"
+            echo "| **Visibility** | \`${{ inputs.visibility }}\` |"
+            echo ""
+            echo "### Repositories"
+            IFS=',' read -ra SUFFIXES <<< "${{ inputs.repositories }}"
+            for s in "${SUFFIXES[@]}"; do
+              s=$(echo "$s" | xargs)
+              echo "- [\`${PROJECT}-${s}\`](https://github.com/${{ vars.GITHUB_ORG }}/${PROJECT}-${s})"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
